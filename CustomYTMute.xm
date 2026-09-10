@@ -3,6 +3,11 @@
 
 static BOOL CustomYTMuteEnabled = NO;
 
+// Saved original IMPs. Captured once at dylib load time so the swizzled
+// implementations can call through without recursing into themselves.
+static BOOL (*CustomYT_originalSetCategoryWithOptions)(id, SEL, NSString *, AVAudioSessionCategoryOptions, NSError **);
+static BOOL (*CustomYT_originalSetCategory)(id, SEL, NSString *, NSError **);
+
 static void CustomYTToggleMute(void) {
     AVAudioSession *session = [AVAudioSession sharedInstance];
 
@@ -28,18 +33,34 @@ static void CustomYTToggleMute(void) {
     NSLog(@"[CustomYT] Mute: %@", newState ? @"ON" : @"OFF");
 }
 
-// Force every setCategory:withOptions:error: call to use ambient + mixWithOthers.
-// YouTube's own code (and any third-party player code) may try to switch the
-// session back to `playback` after the toggle above runs; this swizzle makes
-// sure it sticks so muting YouTube never takes over the system audio.
+// Swizzled: ignore the requested category/options and always use
+// ambient + mixWithOthers so YouTube (or AVPlayer) can't switch the
+// session back to a playback-mode category that silences other apps.
 static BOOL CustomYT_swizzledSetCategoryWithOptions(id self, SEL _cmd, NSString *category, AVAudioSessionCategoryOptions options, NSError **outError) {
-    Method method = class_getInstanceMethod([self class], _cmd);
-    BOOL (*original)(id, SEL, NSString *, AVAudioSessionCategoryOptions, NSError **) =
-        (BOOL (*)(id, SEL, NSString *, AVAudioSessionCategoryOptions, NSError **))method_getImplementation(method);
-    return original(self, _cmd, AVAudioSessionCategoryAmbient, AVAudioSessionCategoryOptionMixWithOthers, outError);
+    return CustomYT_originalSetCategoryWithOptions(self, _cmd,
+        AVAudioSessionCategoryAmbient,
+        AVAudioSessionCategoryOptionMixWithOthers,
+        outError);
+}
+
+static BOOL CustomYT_swizzledSetCategory(id self, SEL _cmd, NSString *category, NSError **outError) {
+    return CustomYT_originalSetCategory(self, _cmd, AVAudioSessionCategoryAmbient, outError);
 }
 
 __attribute__((constructor)) static void CustomYTInit(void) {
-    Method method = class_getInstanceMethod([AVAudioSession class], @selector(setCategory:withOptions:error:));
-    method_setImplementation(method, (IMP)CustomYT_swizzledSetCategoryWithOptions);
+    Class cls = [AVAudioSession class];
+
+    Method m3 = class_getInstanceMethod(cls, @selector(setCategory:withOptions:error:));
+    if (m3) {
+        CustomYT_originalSetCategoryWithOptions =
+            (BOOL (*)(id, SEL, NSString *, AVAudioSessionCategoryOptions, NSError **))method_getImplementation(m3);
+        method_setImplementation(m3, (IMP)CustomYT_swizzledSetCategoryWithOptions);
+    }
+
+    Method m2 = class_getInstanceMethod(cls, @selector(setCategory:error:));
+    if (m2) {
+        CustomYT_originalSetCategory =
+            (BOOL (*)(id, SEL, NSString *, NSError **))method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)CustomYT_swizzledSetCategory);
+    }
 }
